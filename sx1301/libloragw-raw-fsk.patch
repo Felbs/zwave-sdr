@@ -1,0 +1,38 @@
+--- a/libloragw/src/loragw_hal.c
++++ b/libloragw/src/loragw_hal.c
+@@ -128,6 +128,7 @@
+ static uint8_t lora_rx_sf; /* spreading factor setting for LoRa standalone modem */
+ static bool lora_rx_ppm_offset;
+ 
++int lgw_fsk_raw = 0; /* zwave: raw FSK framing (set by caller) */
+ static uint8_t fsk_rx_bw; /* bandwidth setting of FSK modem */
+ static uint32_t fsk_rx_dr; /* FSK modem datarate in bauds */
+ static uint8_t fsk_sync_word_size = 3; /* default number of bytes for FSK sync word */
+@@ -1556,7 +1557,11 @@
+         /* TODO: how to handle 255 bytes packets ?!? */
+ 
+         /* metadata 11, packet mode, CRC, encoding */
+-        buff[11] = 0x01 | (pkt_data.no_crc?0:0x02) | (0x02 << 2); /* always in variable length packet mode, whitening, and CCITT CRC if CRC is not disabled  */
++        if (lgw_fsk_raw) {
++            buff[11] = 0x00; /* zwave: fixed length, no CRC, no whitening */
++        } else {
++            buff[11] = 0x01 | (pkt_data.no_crc?0:0x02) | (0x02 << 2); /* always in variable length packet mode, whitening, and CCITT CRC if CRC is not disabled  */
++        }
+ 
+         /* metadata 12 & 13, FSK preamble size */
+         if (pkt_data.preamble == 0) { /* if not explicit, use LoRa MAC preamble size */
+@@ -1574,9 +1579,11 @@
+         buff[15] = 0xFF & fsk_dr_div;
+ 
+         /* insert payload size in the packet for variable mode */
+-        buff[16] = pkt_data.size;
+-        ++transfer_size; /* one more byte to transfer to the TX modem */
+-        ++payload_offset; /* start the payload with one more byte of offset */
++        if (!lgw_fsk_raw) {
++            buff[16] = pkt_data.size;
++            ++transfer_size; /* one more byte to transfer to the TX modem */
++            ++payload_offset; /* start the payload with one more byte of offset */
++        }
+ 
+         /* MSB of RF frequency is now used in AGC firmware to implement large/narrow filtering in SX1257/55 */
+         buff[0] &= 0x7F; /* Always use narrow band for FSK (force MSB to 0) */

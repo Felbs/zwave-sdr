@@ -1,0 +1,10 @@
+# captures and run logs stay local: they contain real network IDs
+*.npy
+*.npz
+*.cs16
+*.txt
+!requirements.txt
+__pycache__/
+sx1301/lora_gateway/
+sx1301/zwrx
+sx1301/zwtx
