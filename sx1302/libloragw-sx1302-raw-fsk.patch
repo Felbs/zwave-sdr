@@ -1,0 +1,47 @@
+--- a/libloragw/src/loragw_sx1302.c
++++ b/libloragw/src/loragw_sx1302.c
+@@ -2395,6 +2395,8 @@
+ 
+ /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+ 
++int lgw_fsk_raw = 0; /* zwave: raw FSK framing (fixed length, no CRC, no whitening, no shaping, no length byte) */
++
+ int sx1302_send(lgw_radio_type_t radio_type, struct lgw_tx_gain_lut_s * tx_lut, bool lwan_public, struct lgw_conf_rxif_s * context_fsk, struct lgw_pkt_tx_s * pkt_data) {
+     int err;
+     uint32_t freq_reg, fdev_reg;
+@@ -2659,15 +2661,15 @@
+             CHECK_ERR(err);
+ 
+             /* Modulation parameters */
+-            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_PKT_MODE(pkt_data->rf_chain), 1); /* Variable length */
++            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_PKT_MODE(pkt_data->rf_chain), lgw_fsk_raw ? 0 : 1); /* Variable length */
+             CHECK_ERR(err);
+-            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_CRC_EN(pkt_data->rf_chain), (pkt_data->no_crc) ? 0 : 1);
++            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_CRC_EN(pkt_data->rf_chain), (pkt_data->no_crc || lgw_fsk_raw) ? 0 : 1);
+             CHECK_ERR(err);
+             err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_CRC_IBM(pkt_data->rf_chain), 0); /* CCITT CRC */
+             CHECK_ERR(err);
+-            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_DCFREE_ENC(pkt_data->rf_chain), 2); /* Whitening Encoding */
++            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_CFG_0_DCFREE_ENC(pkt_data->rf_chain), lgw_fsk_raw ? 0 : 2); /* Whitening Encoding */
+             CHECK_ERR(err);
+-            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_MOD_FSK_GAUSSIAN_EN(pkt_data->rf_chain), 1);
++            err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_MOD_FSK_GAUSSIAN_EN(pkt_data->rf_chain), lgw_fsk_raw ? 0 : 1);
+             CHECK_ERR(err);
+             err = lgw_reg_w(SX1302_REG_TX_TOP_FSK_MOD_FSK_GAUSSIAN_SELECT_BT(pkt_data->rf_chain), 2);
+             CHECK_ERR(err);
+@@ -2734,10 +2736,15 @@
+     CHECK_ERR(err);
+     mem_addr = REG_SELECT(pkt_data->rf_chain, 0x5300, 0x5500);
+     if (pkt_data->modulation == MOD_FSK) {
++        if (lgw_fsk_raw) {
++            err = lgw_mem_wb(mem_addr, &(pkt_data->payload[0]), pkt_data->size);
++            CHECK_ERR(err);
++        } else {
+         err = lgw_mem_wb(mem_addr, (uint8_t *)(&(pkt_data->size)), 1); /* insert payload size in the packet for FSK variable mode (1 byte) */
+         CHECK_ERR(err);
+         err = lgw_mem_wb(mem_addr+1, &(pkt_data->payload[0]), pkt_data->size);
+         CHECK_ERR(err);
++        }
+     } else {
+         err = lgw_mem_wb(mem_addr, &(pkt_data->payload[0]), pkt_data->size);
+         CHECK_ERR(err);

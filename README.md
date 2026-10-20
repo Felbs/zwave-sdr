@@ -37,6 +37,7 @@ thermostat we measured takes 3.3 ms.
 |---|---|---|
 | `rspdx/` | `zw_rec.py` record both US channels to RAM · `zw_chan.py` cut the 908.4/916.0 channels · `zw_decode.py` find and check frames | any Linux box with SoapySDR + numpy/scipy (written for an SDRplay RSPdx) |
 | `sx1301/` | `zwrx.c` receive · `zwtx.c` transmit · `zwparse.py` frame finder/checksum · `libloragw-raw-fsk.patch` + `build.sh` | the hotspot's own CPU (tested: Nebra Outdoor, Pi CM3, Arch Linux ARM) |
+| `sx1302/` | `zwtx1302.c` transmit · `zwack1302.c` receive and auto-ACK · `libloragw-sx1302-raw-fsk.patch` | a host with an SX1302/SX1250 concentrator (tested: RAK5146 over USB in an ex-FreedomFi box) |
 | `heltec/` | `zwheltec.py` raw-FSK receive/send for MicroPython on a Heltec WiFi LoRa 32 V3 | the board, via mpremote or a raw-REPL helper |
 
 ## Listening with an SDR
@@ -78,6 +79,33 @@ constant). Use the hotspot's own reset line before every start
 (`gpioset -c gpiochip0 -t 100ms,0 38=1` on the Nebra Outdoor); the first
 radio calibration fails about one start in five — just start again.
 
+## The SX1302 (RAK5146) as a Z-Wave radio — with ACKs
+
+Semtech's newer concentrator does the same job with register-level framing:
+the patch adds `lgw_fsk_raw` to `sx1302_send` (fixed length, no CRC, no
+whitening, no Gaussian shaping, no length byte). Two things that cost time:
+
+- **The transmitter reuses the receiver's FSK sync word.** Receive on
+  `0x5555` and your ACKs go out with `5555` where the start-of-frame belongs.
+  Set the FSK channel's sync word to `0xAA0F` — the Z-Wave SOF in the chip's
+  native (inverted) polarity — for both directions; received blocks then
+  start at the Home ID.
+- The FSK receiver is IF chain 9, and the TX gain table rejects an SX1250
+  entry unless `mix_gain` is 5–15 even though the SX1250 ignores it.
+
+Measured (Heltec sends frames that ask for an ACK, `zwack1302` answers, an SDR
+records both): 6/6 ACKs correct, **4.3–5.1 ms of silence** after the frame,
+so the ACK's start-of-frame arrives ~6.7 ms after the frame ends — a little
+earlier than the real battery thermostat's (~7.2 ms), well behind a
+mains-powered hub (~2.5 ms). The host's share: the frame is fetched over USB
+1.1–1.9 ms after the concentrator timestamps it; transmit start-up is ~3.5 ms.
+
+```
+gcc ... zwack1302.c -lloragw -ltinymt32 -lparson -lbase64 -lrt -lm -lpthread
+./zwack1302 30 2          # answer frames addressed to node 2 for 30 s
+ZW_PWRIDX=3 ./zwtx1302 10 300 c0dec0de0141010b0200
+```
+
 ## The Heltec as the referee
 
 `zwheltec.py` drives the SX1262 in raw GFSK with the same grid: 40 kbit/s,
@@ -112,7 +140,9 @@ are git-ignored here, and none should be shared without masking.
 - [x] SDR: record, channelize, decode (91 checksum-verified frames across two captures)
 - [x] SX1301 receive (hears the battery device the SDR could not)
 - [x] SX1301 transmit, verified byte-exact on an independent receiver
-- [ ] ACK timing on the SX1301 (target: 0.6 ms like the hub; retries at 40–75 ms give some slack)
+- [x] SX1302 transmit + automatic ACK, on-air ACK timing comparable to a real battery device
+- [ ] Explain the SX1301 board's weak transmit (~39 dB below an SX1262 at the same setting, same room; the chip's power steps are linear)
+- [ ] Heltec receive reliability (catches 1–11 of 15 at random; its transmit is fine)
 - [ ] Inclusion (pairing) with no security, then S2
 - [ ] Set a thermostat setpoint from the hotspot
 
