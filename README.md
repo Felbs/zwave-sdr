@@ -37,8 +37,8 @@ thermostat we measured takes 3.3 ms.
 |---|---|---|
 | `rspdx/` | `zw_rec.py` record both US channels to RAM · `zw_chan.py` cut the 908.4/916.0 channels · `zw_decode.py` find and check frames | any Linux box with SoapySDR + numpy/scipy (written for an SDRplay RSPdx) |
 | `sx1301/` | `zwrx.c` receive · `zwtx.c` transmit · `zwparse.py` frame finder/checksum · `libloragw-raw-fsk.patch` + `build.sh` | the hotspot's own CPU (tested: Nebra Outdoor, Pi CM3, Arch Linux ARM) |
-| `sx1302/` | `zwtx1302.c` transmit · `zwack1302.c` receive and auto-ACK · `libloragw-sx1302-raw-fsk.patch` | a host with an SX1302/SX1250 concentrator (tested: RAK5146 over USB in an ex-FreedomFi box) |
-| `heltec/` | `zwheltec.py` raw-FSK receive/send for MicroPython on a Heltec WiFi LoRa 32 V3 | the board, via mpremote or a raw-REPL helper |
+| `sx1302/` | `zwctl1302.c` a small hub: add a device, read/set a thermostat setpoint, wake-up beam · `zwtx1302.c` transmit · `zwack1302.c` receive and auto-ACK · `libloragw-sx1302-raw-fsk.patch` | a host with an SX1302/SX1250 concentrator (tested: RAK5146 over USB in an ex-FreedomFi box) |
+| `heltec/` | `zwheltec.py` raw-FSK receive/send for MicroPython on a Heltec WiFi LoRa 32 V3 · `zwdev.py` a mock device for testing the hub's add sequence | the board, via mpremote or a raw-REPL helper |
 
 ## Listening with an SDR
 
@@ -106,6 +106,40 @@ gcc ... zwack1302.c -lloragw -ltinymt32 -lparson -lbase64 -lrt -lm -lpthread
 ZW_PWRIDX=3 ./zwtx1302 10 300 c0dec0de0141010b0200
 ```
 
+## A small hub: adding a device, reading and setting a setpoint
+
+`zwctl1302` keeps its own network ID (`home_id`, random on first run, first two
+bits set as the protocol reserves for hubs) and is node 1. The sequence it
+runs when its owner puts a device in "add" mode — verified on the air with an
+SDR recording every frame, against the mock device in `heltec/zwdev.py`:
+
+```
+device (node 0, temporary ID)  →  broadcast   node-information frame     01 01 ...
+hub → device (temporary ID)                    assign IDs                 01 03 <node> <home ID×4>   (ACK)
+hub → node 2 (our ID)                          request node information   01 02                      (ACK)
+node 2 → hub                                   node-information frame     01 01 ...                  (ACK)
+hub → node 2   thermostat setpoint get   43 02 01      →   report 43 03 01 2A 02 A8  = 68.0 °F
+hub → node 2   thermostat setpoint set   43 01 01 2A 02 CB (71.5 °F)       (ACK)   → get reads 71.5
+```
+
+The protocol command numbers and layouts are from the Z-Wave JS source
+(protocol CC 0x01; NIF 0x01, request 0x02, assign IDs 0x03 with the node ID
+first then the four Home ID bytes; three capability bytes then basic, generic,
+[specific] device class and the command-class list). The *order* of steps is
+the ordinary one every open hub implements, written from memory of the public
+protocol description and not yet confirmed against a commercial device: the
+real thermostat is still on its original hub. Not implemented: neighbour
+discovery, S2 security (the device will join without it), removing a device.
+
+A mock written by the same person proves self-consistency, not conformance;
+the SDR recording proves what was on the air. The next test is a real
+thermostat, whose own buttons start the add sequence.
+
+`zwctl1302 beam NODE HASH` sends the 1.11 s wake-up beam we measured
+(`[preamble, SOF, 0x55, node, Home-ID hash]` repeated) for a sleeping battery
+device. One measured sample is not enough to pin the hash function (94
+CRC-8 variants fit it), so the hash will be found by trial on our own device.
+
 ## The Heltec as the referee
 
 `zwheltec.py` drives the SX1262 in raw GFSK with the same grid: 40 kbit/s,
@@ -116,7 +150,9 @@ poor judge of the SX1301's transmissions (a few dB above the floor on the
 antennas to hand), and proving transmission needs a receiver that was not
 written by the same person on the same afternoon. The micropython-lib driver's
 shared command buffer is 9 bytes; the FSK packet-params command needs 10, so
-the script enlarges it.
+the script enlarges it. Receive bandwidth: code 0x1A is 78 kHz (we assumed
+156) and cut the edges of a ±20 kHz, 40 kbit/s signal a few kHz off centre —
+frames came and went at random until it was set to 0x19 (156 kHz).
 
 ## Polarity, measured three ways
 
@@ -142,9 +178,10 @@ are git-ignored here, and none should be shared without masking.
 - [x] SX1301 transmit, verified byte-exact on an independent receiver
 - [x] SX1302 transmit + automatic ACK, on-air ACK timing comparable to a real battery device
 - [ ] Explain the SX1301 board's weak transmit (~39 dB below an SX1262 at the same setting, same room; the chip's power steps are linear)
-- [ ] Heltec receive reliability (catches 1–11 of 15 at random; its transmit is fine)
-- [ ] Inclusion (pairing) with no security, then S2
-- [ ] Set a thermostat setpoint from the hotspot
+- [x] Heltec receive reliability — it was the RX bandwidth code (0x1A is 78 kHz, not 156; 0x19 is), plus RX gain boost: 15/15
+- [x] Add a device, read and set a thermostat setpoint — against a mock device, every frame confirmed on the air by an SDR
+- [ ] The same with the real thermostat (needs its owner at the buttons)
+- [ ] Wake-up beam hash function (one sample; find by trial), S2 security, removing a device
 
 MIT. Measurements and captures from a suburban house, one commercial alarm
 hub, one Z-Wave Plus thermostat.
