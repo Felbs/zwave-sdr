@@ -37,7 +37,7 @@ thermostat we measured takes 3.3 ms.
 |---|---|---|
 | `rspdx/` | `zw_rec.py` record both US channels to RAM · `zw_chan.py` cut the 908.4/916.0 channels · `zw_decode.py` find and check frames | any Linux box with SoapySDR + numpy/scipy (written for an SDRplay RSPdx) |
 | `sx1301/` | `zwrx.c` receive · `zwtx.c` transmit · `zwparse.py` frame finder/checksum · `libloragw-raw-fsk.patch` + `build.sh` | the hotspot's own CPU (tested: Nebra Outdoor, Pi CM3, Arch Linux ARM) |
-| `sx1302/` | `zwctl1302.c` a small hub: add a device, read/set a thermostat setpoint, wake-up beam · `zwtx1302.c` transmit · `zwack1302.c` receive and auto-ACK · `libloragw-sx1302-raw-fsk.patch` | a host with an SX1302/SX1250 concentrator (tested: RAK5146 over USB in an ex-FreedomFi box) |
+| `sx1302/` | `zwctl1302.c` a small hub: add a device, read/set a thermostat setpoint, wake-up beam, `cmd` for any command class · `zwsurvey.py` decodes the replies (setpoints, modes, sensors, battery, configuration parameters) · `zwtx1302.c` transmit · `zwack1302.c` receive and auto-ACK · `libloragw-sx1302-raw-fsk.patch` | a host with an SX1302/SX1250 concentrator (tested: RAK5146 over USB in an ex-FreedomFi box) |
 | `heltec/` | `zwheltec.py` raw-FSK receive/send for MicroPython on a Heltec WiFi LoRa 32 V3 · `zwdev.py` a mock device for testing the hub's add sequence | the board, via mpremote or a raw-REPL helper |
 
 ## Listening with an SDR
@@ -180,8 +180,34 @@ are git-ignored here, and none should be shared without masking.
 - [ ] Explain the SX1301 board's weak transmit (~39 dB below an SX1262 at the same setting, same room; the chip's power steps are linear)
 - [x] Heltec receive reliability — it was the RX bandwidth code (0x1A is 78 kHz, not 156; 0x19 is), plus RX gain boost: 15/15
 - [x] Add a device, read and set a thermostat setpoint — against a mock device, every frame confirmed on the air by an SDR
-- [ ] The same with the real thermostat (needs its owner at the buttons)
-- [ ] Wake-up beam hash function (one sample; find by trial), S2 security, removing a device
+- [x] The same with the real thermostat, on its wall: paired as node 2, setpoint read and set both ways, mode switched, a configuration parameter changed, and unsolicited reports received after setting the lifeline association
+- [x] Wake-up code found by trial (`scan`: 3 tries); the hash function itself is still unknown (two samples now)
+- [ ] S2 security, removing a device, listening continuously while the concentrator also serves LoRa
+
+## What the real thermostat taught us (that the mock could not)
+
+Three things stood between "works against a mock" and "works against the
+thermostat", all found with the SDR recording what the thermostat actually
+sent while its owner pressed *include*:
+
+1. **Its announcement is 50 bytes** (20 command classes); the hub's fixed
+   receive block was 32.
+2. **It announces inside a hub-search envelope** (frame type 5, 12 bytes
+   before the node-information frame), not as a plain broadcast.
+3. **Its preamble is ~170 bits long.** The SX1302's FSK modem waits only 128
+   bit-times after detecting a preamble for the sync word to arrive
+   (`FSK_TIMEOUT`, HAL default 128), then gives up — so the concentrator
+   heard the alarm hub and the mock (short preambles) and never the
+   thermostat, even from a metre away. Raised to 1023. If a chip hears
+   some senders and not others, compare preamble lengths against its sync
+   timeout before blaming signal level.
+
+Also: the over-the-air node-information frame has **no basic-device-class
+byte** (capabilities ×3, generic, specific, command classes), unlike the
+serial-API form; the thermostat answers a wake-up beam + command within
+~31 ms; back-to-back beams lose replies, so leave a few seconds between
+commands; and the lifeline association (group 1 → node 1) makes it report
+setpoint and mode changes on its own.
 
 MIT. Measurements and captures from a suburban house, one commercial alarm
 hub, one Z-Wave Plus thermostat.

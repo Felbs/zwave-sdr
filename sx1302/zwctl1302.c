@@ -28,7 +28,7 @@
 #include "loragw_reg.h"
 
 extern int lgw_fsk_raw;
-#define BLK 32                /* fixed receive block: covers a NIF with ~15 command classes */
+#define BLK 64                /* fixed receive block: a real thermostat NIF is ~50 bytes */
 #define ZW_HOME_FILE (getenv("ZW_HOME_FILE") ? getenv("ZW_HOME_FILE") : "home_id")
 #define ME 1
 static uint8_t HOME[4];
@@ -84,7 +84,12 @@ static int recv_frame(double timeout_s, frame_t *f) {
         int n = lgw_receive(8, pk);
         for (int i = 0; i < n; i++) {
             if (pk[i].modulation != MOD_FSK) continue;
-            if (!parse(pk[i].payload, pk[i].size > BLK ? BLK : pk[i].size, f)) continue;
+            if (!parse(pk[i].payload, pk[i].size > BLK ? BLK : pk[i].size, f)) {
+                printf("raw block size=%u:", pk[i].size);
+                for (int k = 0; k < (pk[i].size > 24 ? 24 : pk[i].size); k++) printf(" %02x", pk[i].payload[k] ^ 0xFF);
+                printf("\n"); fflush(stdout);
+                continue;
+            }
             f->t_us = pk[i].count_us;
             if (f->ackreq && f->dst == ME && !memcmp(f->home, HOME, 4) && f->type == 1)
                 send_frame(HOME, ME, f->src, 3, 0, f->seq, NULL, 0);
@@ -115,13 +120,14 @@ static int send_acked(const uint8_t *home, uint8_t dst, const uint8_t *pl, int p
 }
 
 static void nif_print(const uint8_t *p, int n) {
+    /* over-the-air NIF: cap0 cap1 cap2 generic [specific] command-classes (no basic-class byte) */
     if (n < 5) { printf("   short NIF\n"); return; }
     int specific = p[1] & 0x04;
-    printf("   NIF: listening=%d routing=%d speed40k=%d FLiRS=%s beaming=%d security=%d basic=%02x generic=%02x specific=%02x\n",
+    printf("   NIF: listening=%d routing=%d speed40k=%d FLiRS=%s beaming=%d security=%d generic=%02x specific=%02x\n",
            !!(p[0] & 0x80), !!(p[0] & 0x40), !!(p[0] & 0x10), (p[1] & 0x60) == 0x40 ? "1000ms" : (p[1] & 0x60) == 0x20 ? "250ms" : "no",
-           !!(p[1] & 0x10), p[1] & 1, p[3], p[4], specific ? p[5] : 0);
+           !!(p[1] & 0x10), p[1] & 1, p[3], specific ? p[4] : 0);
     printf("   command classes:");
-    for (int i = specific ? 6 : 5; i < n; i++) printf(" %02x", p[i]);
+    for (int i = specific ? 5 : 4; i < n; i++) printf(" %02x", p[i]);
     printf("\n");
 }
 
@@ -147,6 +153,10 @@ static int radio_start(void) {
     lgw_reg_w(SX1302_REG_RX_TOP_LORA_SERVICE_FSK_FSK_CFG_0_CRC_EN, 0);
     lgw_reg_w(SX1302_REG_RX_TOP_LORA_SERVICE_FSK_FSK_CFG_0_DCFREE_ENC, 0);
     lgw_reg_w(SX1302_REG_RX_TOP_LORA_SERVICE_FSK_FSK_PKT_LENGTH_PKT_LENGTH, BLK);
+    /* wait up to 1023 bit-times (HAL default 128) for the start marker after the preamble is
+       detected: a battery thermostat's preamble is ~170 bits and was timing out every time */
+    lgw_reg_w(SX1302_REG_RX_TOP_LORA_SERVICE_FSK_FSK_TIMEOUT_MSB_TIMEOUT, 3);
+    lgw_reg_w(SX1302_REG_RX_TOP_LORA_SERVICE_FSK_FSK_TIMEOUT_LSB_TIMEOUT, 255);
     lgw_fsk_raw = 1;
     memset(&txp, 0, sizeof txp);
     txp.freq_hz = 908400000; txp.tx_mode = IMMEDIATE; txp.rf_chain = 0; txp.rf_power = 0;
@@ -161,6 +171,24 @@ static void load_home(void) {
     int fd = open("/dev/urandom", O_RDONLY); if (read(fd, HOME, 4) != 4) { HOME[0]=0xC0; HOME[1]=0xDE; HOME[2]=0x12; HOME[3]=0x34; } close(fd);
     HOME[0] = (HOME[0] & 0x3F) | 0xC0;       /* keep it in the range the protocol reserves for hubs (first bits 11) */
     fp = fopen(ZW_HOME_FILE, "wb"); fwrite(HOME, 1, 4, fp); fclose(fp);
+}
+
+
+/* 1.11 s wake-up beam for a sleeping (FLiRS) node: [preamble, SOF, 0x55, node, home-ID hash] repeated */
+static int do_beam(int node, int hash) {
+    uint8_t frag[25]; int k = 0;
+    for (; k < 20; k++) frag[k] = 0x55;
+    frag[k++] = 0xF0; frag[k++] = 0x55; frag[k++] = (uint8_t)node; frag[k++] = (uint8_t)hash;
+    txp.size = 0; txp.preamble = 10;
+    txp.payload[txp.size++] = 0x55 ^ 0xFF; txp.payload[txp.size++] = (uint8_t)node ^ 0xFF; txp.payload[txp.size++] = (uint8_t)hash ^ 0xFF;
+    while (txp.size + k <= 250) { for (int i = 0; i < k; i++) txp.payload[txp.size++] = frag[i] ^ 0xFF; }
+    double t0 = wall(); int pkts = 0;
+    while (wall() - t0 < 1.15) {
+        lgw_send(&txp); pkts++;
+        uint8_t st = 0; int polls = 0;
+        do { lgw_status(0, TX_STATUS, &st); polls++; } while ((st == TX_SCHEDULED || st == TX_EMITTING) && polls < 5000);
+    }
+    return pkts;
 }
 
 int main(int argc, char **argv) {
@@ -182,9 +210,10 @@ int main(int argc, char **argv) {
         while (wall() < end) {
             if (!recv_frame(end - wall(), &f)) break;
             show(&f, "rx");
-            if (!(f.plen >= 2 && f.payload[0] == 0x01 && f.payload[1] == 0x01 && f.src == 0)) continue;
+            int off = (f.type == 5) ? 12 : 0;   /* type 5 = announcement inside a 12-byte hub-search envelope */
+            if (!(f.src == 0 && f.plen >= off + 2 && f.payload[off] == 0x01 && f.payload[off + 1] == 0x01)) continue;
             printf("device announced itself under temporary home %02x%02x%02x%02x\n", f.home[0], f.home[1], f.home[2], f.home[3]);
-            nif_print(f.payload + 2, f.plen - 2);
+            nif_print(f.payload + off + 2, f.plen - off - 2);
             uint8_t dev_home[4]; memcpy(dev_home, f.home, 4);
             uint8_t pl7[7] = {0x01, 0x03, (uint8_t)newnode, HOME[0], HOME[1], HOME[2], HOME[3]};   /* AssignIDs */
             printf("assigning node %d on our network...\n", newnode); fflush(stdout);
@@ -201,6 +230,39 @@ int main(int argc, char **argv) {
                 }
             }
             break;
+        }
+    }
+    else if (!strcmp(cmd, "scan")) {
+        int node = atoi(argv[2]);
+        int first = argc > 3 ? (int)strtol(argv[3], NULL, 16) : 0;
+        uint8_t pl[3] = {0x43, 0x02, 0x01};
+        for (int i = 0; i < 256; i++) {
+            int hash = (first + i) & 0xFF;
+            do_beam(node, hash);
+            if (send_acked(HOME, node, pl, 3, &f)) {
+                printf("FOUND beam hash %02x for node %d\n", hash, node); fflush(stdout);
+                double e2 = wall() + 3;
+                while (wall() < e2 && recv_frame(e2 - wall(), &f)) {
+                    show(&f, "rx");
+                    if (f.plen >= 5 && f.payload[0] == 0x43 && f.payload[1] == 0x03) { printf("setpoint report received\n"); break; }
+                }
+                break;
+            }
+            printf("hash %02x: no answer\n", hash); fflush(stdout);
+        }
+    }
+    else if (!strcmp(cmd, "cmd")) {
+        /* cmd NODE HASH HEX [HEX ...]: wake the node once, then send each payload with ACK request
+           and print every frame that comes back within 2 s */
+        int node = atoi(argv[2]); int hash = (int)strtol(argv[3], NULL, 16);
+        for (int a = 4; a < argc; a++) {
+            uint8_t pl[64]; int n = 0;
+            for (size_t i = 0; i + 1 < strlen(argv[a]) && n < 63; i += 2) { unsigned v; sscanf(argv[a] + i, "%2x", &v); pl[n++] = v; }
+            do_beam(node, hash);
+            printf("send %s\n", argv[a]); fflush(stdout);
+            if (!send_acked(HOME, node, pl, n, &f)) { printf("   no ACK\n"); continue; }
+            double e2 = wall() + 2;
+            while (wall() < e2 && recv_frame(e2 - wall(), &f)) if (f.src == node) show(&f, "   reply");
         }
     }
     else if (!strcmp(cmd, "get") || !strcmp(cmd, "set") || !strcmp(cmd, "beam")) {
@@ -223,6 +285,8 @@ int main(int argc, char **argv) {
             }
             printf("beam: %d packets in %.2f s for node %d hash %02x\n", pkts, wall() - t0, node, hash); fflush(stdout);
         }
+        if (!strcmp(cmd, "set") && argc > 4) do_beam(node, (int)strtol(argv[4], NULL, 16));   /* set NODE DEG_F [HASH] */
+        if (!strcmp(cmd, "get") && argc > 3) do_beam(node, (int)strtol(argv[3], NULL, 16));   /* get NODE [HASH] */
         if (!strcmp(cmd, "set")) {
             int tenths = (int)(atof(argv[3]) * 10 + 0.5);
             uint8_t pl[6] = {0x43, 0x01, 0x01, 0x2A, (uint8_t)(tenths >> 8), (uint8_t)tenths};  /* Setpoint Set, heating, precision 1, F, 2 bytes */
